@@ -2,7 +2,11 @@ import json
 import re
 from typing import Any
 
-from src.llm import AgentResponse, generate_response
+from src.llm import (
+    AgentDecision,
+    AgentResponse,
+    generate_decision,
+)
 from src.orders import (
     get_order_for_user,
     get_today,
@@ -14,26 +18,36 @@ from src.retrieval import search_policies
 SYSTEM_PROMPT = """
 You are an LLM-powered customer support assistant.
 
-Answer the shopper using ONLY the supplied policy context and authorized
-order context.
+Your job is to determine what evidence and handling the shopper's request
+requires, and then write a grounded customer-facing answer.
 
-The provided evidence is the only source of truth. Never rely on prior
-knowledge about Sezzle.
+Use ONLY the supplied policy context and authorized order context.
+
+Never rely on prior knowledge about Sezzle for business facts.
 
 ==================================================
 1. GROUNDING
 ==================================================
 
-- Policy facts must come from POLICY CONTEXT.
-- Customer and order facts must come from AUTHORIZED ORDER CONTEXT.
-- Never invent fees, dates, limits, eligibility, order details,
-  payment states, refunds, reasons, or actions.
-- If the evidence is insufficient, clearly say so instead of guessing.
-- Never claim an action was completed unless the context explicitly
-  states that it happened.
+Policy facts must come from POLICY CONTEXT.
 
-Before answering, identify every material policy rule needed to fully
-answer the shopper's question.
+Customer and order facts must come from AUTHORIZED ORDER CONTEXT.
+
+Never invent:
+- fees
+- dates
+- spending limits
+- eligibility
+- order details
+- payment states
+- refund status
+- policy rules
+- actions that were not actually performed
+
+If the evidence is insufficient, say so instead of guessing.
+
+Before answering, identify all material policy rules required to answer
+the shopper fully.
 
 Do not omit relevant:
 - amounts or percentages
@@ -45,74 +59,89 @@ Do not omit relevant:
 - escalation requirements
 
 ==================================================
-2. AUTHORIZATION
+2. EVIDENCE REQUIREMENTS
 ==================================================
 
-Use ONLY order information explicitly present in AUTHORIZED ORDER CONTEXT.
+Set requires_policy=true when company policy is materially needed.
 
-If an order is absent from that context:
+Set requires_order=true only when customer-specific or order-specific
+facts are materially needed.
+
+Do not set requires_order=true merely because an authenticated user ID
+exists. Actual authorized order evidence must be needed.
+
+==================================================
+3. HUMAN HANDLING
+==================================================
+
+Set requires_human=true whenever an applicable policy says that the
+requested determination, filing, review, change, override, investigation,
+or resolution must be handled by a human agent.
+
+This includes cases where you CAN explain the policy but the shopper's
+requested next step requires a human.
+
+Human handling takes priority over all other handling.
+
+Examples of policy language that signals human handling include:
+
+- must be handled by a human agent
+- human-agent action
+- must escalate
+- escalate immediately
+- specific determination must be reviewed by a human
+
+If such a requirement applies, requires_human MUST be true.
+
+Do not set requires_human=false merely because you can explain the
+policy yourself.
+
+==================================================
+4. AUTHORIZATION
+==================================================
+
+Use ONLY order information present in AUTHORIZED ORDER CONTEXT.
+
+If an order is absent:
 - do not infer its details
-- do not reveal whether it belongs to another customer
+- do not reveal whether another shopper owns it
 - do not invent information about it
 
 ==================================================
-3. ROUTING
+5. SENSITIVE INFORMATION
 ==================================================
 
-The route describes what evidence and handling are REQUIRED to answer
-correctly. It is not based on which source seems most important.
+If policy prohibits disclosure of a precise spending limit, do not make
+a value statement about the shopper's limit.
 
-Use:
+Use safe wording such as:
 
-policy
-- The answer can be fully produced from general policy information.
-- No customer-specific order facts are required.
+"I can't provide a precise spending limit. The app shows an estimated
+spending power."
 
-tool
-- The answer can be fully produced from authorized customer/order facts.
-- No policy rule is required to answer correctly.
-
-both
-- Correctly answering requires BOTH:
-  1. one or more company policy rules, AND
-  2. customer-specific or order-specific facts.
-
-IMPORTANT:
-If you use an order fact to determine how a policy applies to that
-shopper, the route is BOTH, not TOOL.
-
-escalate
-- A relevant policy says a human agent must handle the request, OR
-- the requested determination/action is reserved for a human.
-
-ESCALATION HAS HIGHEST PRIORITY.
-
-If a policy requires human handling, the route MUST be "escalate"
-even when policy information and order information are also used.
-
-The answer may explain relevant policy before escalating.
+Do not invent or expose a precise limit.
 
 ==================================================
-4. FINAL CHECK
+6. FINAL CHECK
 ==================================================
 
-Before producing the response, verify:
+Before returning your structured response:
 
-1. Did I rely only on supplied evidence?
-2. Did I include the material rules needed to fully answer the question?
-3. Did I use both policy and order facts?
-   If yes -> route must be "both", unless escalation is required.
-4. Does any applicable policy require a human?
-   If yes -> route must be "escalate".
-5. Did I avoid claiming an unsupported action or result?
+1. Which supplied policies actually apply?
+2. Is policy information materially required?
+3. Are authorized order facts materially required?
+4. Does any applicable policy reserve the shopper's requested next step
+   for a human?
+5. Have all important policy conditions been included?
+6. Does the answer avoid unsupported actions or disclosures?
 
-Return a concise, helpful, customer-facing answer.
+Return a concise and helpful customer-facing answer.
 """
 
 
 def normalize(text: str) -> str:
     """
-    Normalize text for simple merchant-name matching.
+    Normalize text for merchant-name matching.
     """
     return re.sub(
         r"[^a-z0-9]+",
@@ -126,14 +155,10 @@ def select_relevant_orders(
     question: str,
 ) -> tuple[list[dict[str, Any]], str]:
     """
-    Select order context while preserving the authorization boundary.
-
-    Explicit order IDs are resolved only through get_order_for_user().
-    Otherwise, merchant names are matched only against orders already
-    belonging to the authenticated user.
+    Select order context without crossing the authorization boundary.
     """
 
-    # 1. Explicit order ID
+    # Explicit order IDs
     explicit_order_ids = re.findall(
         r"\bord_\d+\b",
         question.lower(),
@@ -156,26 +181,38 @@ def select_relevant_orders(
 
         return (
             [],
-            "The referenced order is not available for the authenticated user. "
-            "Do not reveal whether it exists for another account.",
+            (
+                "The referenced order is not available for the "
+                "authenticated user. Do not reveal whether it "
+                "exists for another account."
+            ),
         )
 
-    # 2. Merchant-name matching
+    # Merchant matching only against this user's orders
     normalized_question = normalize(question)
-    user_orders = get_user_orders(user_id)
+
+    user_orders = get_user_orders(
+        user_id
+    )
 
     matched_orders = []
 
     for order in user_orders:
-        merchant = normalize(order["merchant"])
+        merchant = normalize(
+            order["merchant"]
+        )
 
-        if merchant and merchant in normalized_question:
-            matched_orders.append(order)
+        if (
+            merchant
+            and merchant in normalized_question
+        ):
+            matched_orders.append(
+                order
+            )
 
     if matched_orders:
         return matched_orders, ""
 
-    # No specific order was safely identified.
     return [], ""
 
 
@@ -185,13 +222,17 @@ def build_policy_context(
     """
     Retrieve and format relevant policy documents.
     """
+
     results = search_policies(
         question,
         top_k=3,
     )
 
     if not results:
-        return "No relevant policy context was retrieved."
+        return (
+            "No relevant policy context "
+            "was retrieved."
+        )
 
     blocks = []
 
@@ -205,23 +246,60 @@ TITLE: {result["title"]}
 """.strip()
         )
 
-    return "\n\n---\n\n".join(blocks)
+    return "\n\n---\n\n".join(
+        blocks
+    )
 
 
 def build_order_context(
     orders: list[dict[str, Any]],
 ) -> str:
     """
-    Serialize only already-authorized orders.
+    Serialize already-authorized orders only.
     """
+
     if not orders:
-        return "No authorized order context was selected."
+        return (
+            "No authorized order context "
+            "was selected."
+        )
 
     return json.dumps(
         orders,
         indent=2,
         ensure_ascii=False,
     )
+
+
+def derive_route(
+    decision: AgentDecision,
+) -> str:
+    """
+    Normalize the model's semantic decision into the
+    route required by the challenge contract.
+
+    The LLM still determines whether policy, order data,
+    or human handling are required.
+    """
+
+    if decision.requires_human:
+        return "escalate"
+
+    if (
+        decision.requires_policy
+        and decision.requires_order
+    ):
+        return "both"
+
+    if decision.requires_policy:
+        return "policy"
+
+    if decision.requires_order:
+        return "tool"
+
+    # Safe fallback when the model cannot identify
+    # sufficient evidence or handling.
+    return "escalate"
 
 
 def answer_question(
@@ -234,43 +312,43 @@ def answer_question(
 
     today = get_today()
 
-    policy_context = build_policy_context(
-        question
-    )
-
-    relevant_orders, access_note = (
-        select_relevant_orders(
-            user_id,
-            question,
+    policy_context = (
+        build_policy_context(
+            question
         )
     )
 
-    order_context = build_order_context(
-        relevant_orders
+    (
+        relevant_orders,
+        access_note,
+    ) = select_relevant_orders(
+        user_id,
+        question,
     )
 
-    has_order_context = len(relevant_orders) > 0
+    order_context = (
+        build_order_context(
+            relevant_orders
+        )
+    )
+
+    has_order_context = (
+        len(relevant_orders) > 0
+    )
 
     user_prompt = f"""
 AUTHENTICATED USER
+------------------
 {user_id}
 
 FROZEN CURRENT DATE
+-------------------
 {today}
 
 EVIDENCE AVAILABILITY
 ---------------------
 Policy context available: YES
 Authorized order context available: {"YES" if has_order_context else "NO"}
-
-ROUTE CONSISTENCY RULES
------------------------
-- If authorized order context is NO, "tool" and "both" are invalid routes.
-- Use "both" only when customer-specific order facts were actually supplied
-  AND policy rules are required to answer.
-- If an applicable policy requires human handling, use "escalate" regardless
-  of whether policy or order context is also available.
-- "escalate" has priority over policy, tool, and both.
 
 SHOPPER QUESTION
 ----------------
@@ -288,17 +366,36 @@ ORDER ACCESS NOTE
 -----------------
 {access_note if access_note else "No authorization issue detected."}
 
-Use only the evidence above.
+Determine:
 
-Before answering:
-1. Determine whether the request requires human handling.
-2. Determine whether policy facts are required.
-3. Determine whether authorized order facts are required.
-4. Select the route consistent with those requirements.
-5. Answer using all material rules contained in the relevant policy.
+- requires_policy
+- requires_order
+- requires_human
+- applicable policy sources
+- human requirement, if any
+
+Then write the grounded customer-facing answer.
+
+Remember:
+
+A request may require BOTH policy and order information while ALSO
+requiring human handling. In that situation requires_human must be true.
+
+Explaining a process yourself does not mean the associated filing,
+determination, investigation, override, or resolution can be performed
+without a human.
 """.strip()
 
-    return generate_response(
+    decision = generate_decision(
         SYSTEM_PROMPT,
         user_prompt,
+    )
+
+    route = derive_route(
+        decision
+    )
+
+    return AgentResponse(
+        route=route,
+        answer=decision.answer,
     )

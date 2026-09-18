@@ -133,10 +133,7 @@ def select_relevant_orders(
     belonging to the authenticated user.
     """
 
-    # -----------------------------------------
     # 1. Explicit order ID
-    # -----------------------------------------
-
     explicit_order_ids = re.findall(
         r"\bord_\d+\b",
         question.lower(),
@@ -163,10 +160,7 @@ def select_relevant_orders(
             "Do not reveal whether it exists for another account.",
         )
 
-    # -----------------------------------------
     # 2. Merchant-name matching
-    # -----------------------------------------
-
     normalized_question = normalize(question)
     user_orders = get_user_orders(user_id)
 
@@ -191,7 +185,6 @@ def build_policy_context(
     """
     Retrieve and format relevant policy documents.
     """
-
     results = search_policies(
         question,
         top_k=3,
@@ -221,7 +214,6 @@ def build_order_context(
     """
     Serialize only already-authorized orders.
     """
-
     if not orders:
         return "No authorized order context was selected."
 
@@ -257,6 +249,8 @@ def answer_question(
         relevant_orders
     )
 
+    has_order_context = len(relevant_orders) > 0
+
     user_prompt = f"""
 AUTHENTICATED USER
 {user_id}
@@ -264,11 +258,26 @@ AUTHENTICATED USER
 FROZEN CURRENT DATE
 {today}
 
+EVIDENCE AVAILABILITY
+---------------------
+Policy context available: YES
+Authorized order context available: {"YES" if has_order_context else "NO"}
+
+ROUTE CONSISTENCY RULES
+-----------------------
+- If authorized order context is NO, "tool" and "both" are invalid routes.
+- Use "both" only when customer-specific order facts were actually supplied
+  AND policy rules are required to answer.
+- If an applicable policy requires human handling, use "escalate" regardless
+  of whether policy or order context is also available.
+- "escalate" has priority over policy, tool, and both.
+
 SHOPPER QUESTION
+----------------
 {question}
 
 POLICY CONTEXT
-----------------
+--------------
 {policy_context}
 
 AUTHORIZED ORDER CONTEXT
@@ -279,8 +288,14 @@ ORDER ACCESS NOTE
 -----------------
 {access_note if access_note else "No authorization issue detected."}
 
-Using only this evidence, determine the correct route and write the
-customer-facing answer.
+Use only the evidence above.
+
+Before answering:
+1. Determine whether the request requires human handling.
+2. Determine whether policy facts are required.
+3. Determine whether authorized order facts are required.
+4. Select the route consistent with those requirements.
+5. Answer using all material rules contained in the relevant policy.
 """.strip()
 
     return generate_response(

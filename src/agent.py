@@ -191,14 +191,15 @@ Before returning the structured output verify:
 5. Does any applicable rule require a human?
 6. If human handling is required, did I explicitly say so?
 7. Did I avoid claiming that an action was already performed?
-8. Consistency invariant: if human_requirement is not null or an extracted
-   policy rule explicitly requires human handling, requires_human must be true.
 
 Return grounded information only.
 """
 
 
 def normalize(text: str) -> str:
+    """
+    Normalize text for simple merchant-name matching.
+    """
     return re.sub(
         r"[^a-z0-9]+",
         " ",
@@ -210,6 +211,17 @@ def select_relevant_orders(
     user_id: str,
     question: str,
 ) -> tuple[list[dict[str, Any]], str]:
+    """
+    Select order context while preserving the authorization boundary.
+
+    Explicit order IDs are resolved only through get_order_for_user().
+    Merchant matching is performed only against orders already owned
+    by the authenticated user.
+    """
+
+    # -----------------------------------------
+    # 1. Explicit order ID
+    # -----------------------------------------
 
     explicit_order_ids = re.findall(
         r"\bord_\d+\b",
@@ -239,6 +251,10 @@ def select_relevant_orders(
                 "exists for another account."
             ),
         )
+
+    # -----------------------------------------
+    # 2. Merchant-name matching
+    # -----------------------------------------
 
     normalized_question = normalize(
         question
@@ -270,6 +286,9 @@ def select_relevant_orders(
 def build_policy_context(
     question: str,
 ) -> str:
+    """
+    Retrieve and format relevant policies.
+    """
 
     results = search_policies(
         question,
@@ -302,6 +321,9 @@ TITLE: {result["title"]}
 def build_order_context(
     orders: list[dict[str, Any]],
 ) -> str:
+    """
+    Serialize only already-authorized orders.
+    """
 
     if not orders:
         return (
@@ -315,63 +337,20 @@ def build_order_context(
         ensure_ascii=False,
     )
 
-def has_explicit_human_requirement(
-    decision: AgentDecision,
-) -> bool:
-    """
-    Validate consistency in the LLM structured decision.
-
-    The LLM performs the semantic interpretation. This validator only
-    prevents contradictory output such as extracting an explicit
-    human-handling rule while setting requires_human=False.
-    """
-
-    if decision.requires_human:
-        return True
-
-    if (
-        decision.human_requirement
-        and decision.human_requirement.strip()
-    ):
-        return True
-
-    extracted_rules = " ".join(
-        decision.customer_visible_policy_rules
-    )
-
-    escalation_patterns = [
-        r"\bmust be handled by (?:a )?human\b",
-        r"\brequires? (?:a )?human\b",
-        r"\bhuman[- ]agent action\b",
-        r"\bescalat(?:e|ed|ion)\b",
-        r"\bmanual review\b",
-        r"\bspecialist review\b",
-    ]
-
-    return any(
-        re.search(
-            pattern,
-            extracted_rules,
-            flags=re.IGNORECASE,
-        )
-        for pattern in escalation_patterns
-    )    
-
 
 def derive_route(
     decision: AgentDecision,
     has_order_context: bool,
 ) -> str:
     """
-    Convert the LLM semantic decision into the challenge route.
+    Convert the LLM semantic decision into the route expected
+    by the challenge.
 
-    The LLM decides what is required. This layer validates consistency
-    and enforces route precedence.
+    The LLM determines which evidence and handling are needed.
+    Python only enforces route precedence and consistency.
     """
 
-    if has_explicit_human_requirement(
-        decision
-    ):
+    if decision.requires_human:
         return "escalate"
 
     if (
@@ -400,10 +379,11 @@ def compose_customer_answer(
     route: str,
 ) -> str:
     """
-    Compose the final answer from structured LLM output.
+    Compose the final customer-facing answer from structured
+    LLM output.
 
-    This keeps material policy rules visible instead of relying on
-    the model to remember to repeat every rule in free-form prose.
+    Material policy rules are explicitly included so important
+    conditions are not lost during free-form generation.
     """
 
     sections = []
@@ -429,7 +409,8 @@ def compose_customer_answer(
         sections
     )
 
-    # Structural route/answer consistency.
+    # Ensure an escalation response actually tells the
+    # shopper that human handling is required.
     if route == "escalate":
         escalation_language = re.search(
             (
@@ -460,6 +441,9 @@ def answer_question(
     question: str,
     user_id: str,
 ) -> AgentResponse:
+    """
+    Main agent entry point.
+    """
 
     today = get_today()
 

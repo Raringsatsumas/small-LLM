@@ -18,16 +18,16 @@ from src.retrieval import search_policies
 SYSTEM_PROMPT = """
 You are an LLM-powered customer support assistant.
 
-Your job is to determine what evidence and handling the shopper's request
-requires, and then write a grounded customer-facing answer.
-
 Use ONLY the supplied policy context and authorized order context.
-
 Never rely on prior knowledge about Sezzle for business facts.
 
 ==================================================
-1. GROUNDING
+1. RELEVANCE AND GROUNDING
 ==================================================
+
+Answer only what the shopper actually needs.
+
+Do not add unrelated policy information merely because it was retrieved.
 
 Policy facts must come from POLICY CONTEXT.
 
@@ -36,71 +36,88 @@ Customer and order facts must come from AUTHORIZED ORDER CONTEXT.
 Never invent:
 - fees
 - dates
-- spending limits
+- limits
 - eligibility
-- order details
-- payment states
+- order information
 - refund status
+- payment states
 - policy rules
-- actions that were not actually performed
+- actions that were not performed
 
-If the evidence is insufficient, say so instead of guessing.
+If evidence is insufficient, say so instead of guessing.
 
-Before answering, identify all material policy rules required to answer
-the shopper fully.
+==================================================
+2. WHEN POLICY IS REQUIRED
+==================================================
 
-Do not omit relevant:
-- amounts or percentages
-- timing or waiting periods
-- fees
-- eligibility conditions
+Set requires_policy=true only when policy interpretation is materially
+needed to answer correctly.
+
+IMPORTANT:
+
+A direct lookup of an existing order fact does NOT require policy.
+
+Examples of direct order facts include:
+- next payment amount
+- next payment due date
+- merchant
+- recorded order status
+- recorded installment information
+
+If the shopper only asks for an existing factual value contained in the
+authorized order context, set:
+
+requires_policy=false
+requires_order=true
+
+Do not add policy explanations to a pure factual lookup.
+
+Set requires_policy=true when answering requires:
+- eligibility
+- rules
 - restrictions
+- fees
+- timing requirements
+- allowed actions
+- policy consequences
+- interpretation of how policy applies to an order
+
+==================================================
+3. POLICY COMPLETENESS
+==================================================
+
+Before writing the answer, populate customer_visible_policy_rules with
+EVERY material policy rule needed to fully answer the question.
+
+For broad questions asking how a plan, policy, or process works, extract
+all core mechanics present in the relevant policy, including when
+applicable:
+
+- percentages or amounts
+- timing or cadence
+- waiting periods
+- fees
+- restrictions
+- eligibility conditions
+- consequences
 - required next steps
+- temporary status changes
 - escalation requirements
 
-==================================================
-2. EVIDENCE REQUIREMENTS
-==================================================
+Do not omit an important rule merely to make the response shorter.
 
-Set requires_policy=true when company policy is materially needed.
+Only include policy rules that may safely be disclosed to the shopper.
+
+==================================================
+4. ORDER DATA
+==================================================
 
 Set requires_order=true only when customer-specific or order-specific
-facts are materially needed.
+facts are materially necessary.
 
-Do not set requires_order=true merely because an authenticated user ID
-exists. Actual authorized order evidence must be needed.
+An authenticated user ID alone does not mean order information is needed.
 
-==================================================
-3. HUMAN HANDLING
-==================================================
-
-Set requires_human=true whenever an applicable policy says that the
-requested determination, filing, review, change, override, investigation,
-or resolution must be handled by a human agent.
-
-This includes cases where you CAN explain the policy but the shopper's
-requested next step requires a human.
-
-Human handling takes priority over all other handling.
-
-Examples of policy language that signals human handling include:
-
-- must be handled by a human agent
-- human-agent action
-- must escalate
-- escalate immediately
-- specific determination must be reviewed by a human
-
-If such a requirement applies, requires_human MUST be true.
-
-Do not set requires_human=false merely because you can explain the
-policy yourself.
-
-==================================================
-4. AUTHORIZATION
-==================================================
-
-Use ONLY order information present in AUTHORIZED ORDER CONTEXT.
+Only use order information contained in AUTHORIZED ORDER CONTEXT.
 
 If an order is absent:
 - do not infer its details
@@ -108,41 +125,80 @@ If an order is absent:
 - do not invent information about it
 
 ==================================================
-5. SENSITIVE INFORMATION
+5. HUMAN HANDLING
 ==================================================
 
-If policy prohibits disclosure of a precise spending limit, do not make
-a value statement about the shopper's limit.
+Set requires_human=true whenever an applicable policy reserves the
+requested determination, filing, review, investigation, override,
+change, or resolution for a human.
 
-Use safe wording such as:
+Human handling takes priority over all other handling.
 
-"I can't provide a precise spending limit. The app shows an estimated
-spending power."
+Examples of policy language indicating this include:
 
-Do not invent or expose a precise limit.
+- must be handled by a human agent
+- human-agent action
+- must escalate
+- escalate immediately
+- requires manual review
+- requires specialist review
+
+If the shopper's request falls under such a requirement,
+requires_human MUST be true.
+
+If requires_human=true, the customer-facing answer MUST explicitly say
+that a human agent, support specialist, or support team needs to handle
+or review the request.
+
+IMPORTANT:
+
+Do NOT say:
+- "I've escalated this"
+- "I escalated this"
+- "I've connected you"
+- "I've transferred you"
+
+unless an external action tool actually performed that action.
+
+Instead say:
+
+"This request needs to be handled by a human support agent."
 
 ==================================================
-6. FINAL CHECK
+6. SENSITIVE INFORMATION
 ==================================================
 
-Before returning your structured response:
+Never disclose a precise spending limit when policy prohibits doing so.
 
-1. Which supplied policies actually apply?
-2. Is policy information materially required?
-3. Are authorized order facts materially required?
-4. Does any applicable policy reserve the shopper's requested next step
-   for a human?
-5. Have all important policy conditions been included?
-6. Does the answer avoid unsupported actions or disclosures?
+Do not phrase the response using a statement such as:
 
-Return a concise and helpful customer-facing answer.
+"your limit is ..."
+
+Instead explain that a precise spending limit cannot be provided and,
+when supported by policy, direct the shopper to an estimated spending
+power shown in the app.
+
+==================================================
+7. FINAL CHECK
+==================================================
+
+Before returning the structured output verify:
+
+1. Am I answering only what was asked?
+2. Is policy actually required?
+3. Are authorized order facts actually required?
+4. Have I extracted EVERY material customer-visible policy rule?
+5. Does any applicable rule require a human?
+6. If human handling is required, did I explicitly say so?
+7. Did I avoid claiming that an action was already performed?
+8. Consistency invariant: if human_requirement is not null or an extracted
+   policy rule explicitly requires human handling, requires_human must be true.
+
+Return grounded information only.
 """
 
 
 def normalize(text: str) -> str:
-    """
-    Normalize text for merchant-name matching.
-    """
     return re.sub(
         r"[^a-z0-9]+",
         " ",
@@ -154,11 +210,7 @@ def select_relevant_orders(
     user_id: str,
     question: str,
 ) -> tuple[list[dict[str, Any]], str]:
-    """
-    Select order context without crossing the authorization boundary.
-    """
 
-    # Explicit order IDs
     explicit_order_ids = re.findall(
         r"\bord_\d+\b",
         question.lower(),
@@ -188,8 +240,9 @@ def select_relevant_orders(
             ),
         )
 
-    # Merchant matching only against this user's orders
-    normalized_question = normalize(question)
+    normalized_question = normalize(
+        question
+    )
 
     user_orders = get_user_orders(
         user_id
@@ -206,9 +259,7 @@ def select_relevant_orders(
             merchant
             and merchant in normalized_question
         ):
-            matched_orders.append(
-                order
-            )
+            matched_orders.append(order)
 
     if matched_orders:
         return matched_orders, ""
@@ -219,9 +270,6 @@ def select_relevant_orders(
 def build_policy_context(
     question: str,
 ) -> str:
-    """
-    Retrieve and format relevant policy documents.
-    """
 
     results = search_policies(
         question,
@@ -254,9 +302,6 @@ TITLE: {result["title"]}
 def build_order_context(
     orders: list[dict[str, Any]],
 ) -> str:
-    """
-    Serialize already-authorized orders only.
-    """
 
     if not orders:
         return (
@@ -270,52 +315,156 @@ def build_order_context(
         ensure_ascii=False,
     )
 
-
-def derive_route(
+def has_explicit_human_requirement(
     decision: AgentDecision,
-) -> str:
+) -> bool:
     """
-    Normalize the model's semantic decision into the
-    route required by the challenge contract.
+    Validate consistency in the LLM structured decision.
 
-    The LLM still determines whether policy, order data,
-    or human handling are required.
+    The LLM performs the semantic interpretation. This validator only
+    prevents contradictory output such as extracting an explicit
+    human-handling rule while setting requires_human=False.
     """
 
     if decision.requires_human:
+        return True
+
+    if (
+        decision.human_requirement
+        and decision.human_requirement.strip()
+    ):
+        return True
+
+    extracted_rules = " ".join(
+        decision.customer_visible_policy_rules
+    )
+
+    escalation_patterns = [
+        r"\bmust be handled by (?:a )?human\b",
+        r"\brequires? (?:a )?human\b",
+        r"\bhuman[- ]agent action\b",
+        r"\bescalat(?:e|ed|ion)\b",
+        r"\bmanual review\b",
+        r"\bspecialist review\b",
+    ]
+
+    return any(
+        re.search(
+            pattern,
+            extracted_rules,
+            flags=re.IGNORECASE,
+        )
+        for pattern in escalation_patterns
+    )    
+
+
+def derive_route(
+    decision: AgentDecision,
+    has_order_context: bool,
+) -> str:
+    """
+    Convert the LLM semantic decision into the challenge route.
+
+    The LLM decides what is required. This layer validates consistency
+    and enforces route precedence.
+    """
+
+    if has_explicit_human_requirement(
+        decision
+    ):
         return "escalate"
 
     if (
         decision.requires_policy
         and decision.requires_order
     ):
+        if not has_order_context:
+            return "escalate"
+
         return "both"
 
     if decision.requires_policy:
         return "policy"
 
     if decision.requires_order:
+        if not has_order_context:
+            return "escalate"
+
         return "tool"
 
-    # Safe fallback when the model cannot identify
-    # sufficient evidence or handling.
     return "escalate"
+
+
+def compose_customer_answer(
+    decision: AgentDecision,
+    route: str,
+) -> str:
+    """
+    Compose the final answer from structured LLM output.
+
+    This keeps material policy rules visible instead of relying on
+    the model to remember to repeat every rule in free-form prose.
+    """
+
+    sections = []
+
+    summary = decision.answer_summary.strip()
+
+    if summary:
+        sections.append(summary)
+
+    if decision.customer_visible_policy_rules:
+        policy_details = "\n".join(
+            f"- {rule}"
+            for rule
+            in decision.customer_visible_policy_rules
+        )
+
+        sections.append(
+            "Key policy details:\n"
+            f"{policy_details}"
+        )
+
+    combined = "\n\n".join(
+        sections
+    )
+
+    # Structural route/answer consistency.
+    if route == "escalate":
+        escalation_language = re.search(
+            (
+                r"\b("
+                r"human|"
+                r"agent|"
+                r"specialist|"
+                r"support team|"
+                r"escalat|"
+                r"hand(?:ed|ing)? over|"
+                r"transfer"
+                r")\b"
+            ),
+            combined,
+            flags=re.IGNORECASE,
+        )
+
+        if not escalation_language:
+            combined += (
+                "\n\nThis request needs to be handled "
+                "by a human support agent."
+            )
+
+    return combined.strip()
 
 
 def answer_question(
     question: str,
     user_id: str,
 ) -> AgentResponse:
-    """
-    Main agent entry point.
-    """
 
     today = get_today()
 
-    policy_context = (
-        build_policy_context(
-            question
-        )
+    policy_context = build_policy_context(
+        question
     )
 
     (
@@ -326,10 +475,8 @@ def answer_question(
         question,
     )
 
-    order_context = (
-        build_order_context(
-            relevant_orders
-        )
+    order_context = build_order_context(
+        relevant_orders
     )
 
     has_order_context = (
@@ -366,24 +513,16 @@ ORDER ACCESS NOTE
 -----------------
 {access_note if access_note else "No authorization issue detected."}
 
-Determine:
-
-- requires_policy
-- requires_order
-- requires_human
-- applicable policy sources
-- human requirement, if any
-
-Then write the grounded customer-facing answer.
+Produce the structured decision.
 
 Remember:
 
-A request may require BOTH policy and order information while ALSO
-requiring human handling. In that situation requires_human must be true.
-
-Explaining a process yourself does not mean the associated filing,
-determination, investigation, override, or resolution can be performed
-without a human.
+- Direct factual order lookups normally require ORDER data but not POLICY.
+- Policy interpretation requires POLICY.
+- Applying policy to a specific order normally requires BOTH.
+- Human-only handling sets requires_human=true.
+- customer_visible_policy_rules must contain every material,
+  safely-disclosable rule required for the answer.
 """.strip()
 
     decision = generate_decision(
@@ -392,10 +531,16 @@ without a human.
     )
 
     route = derive_route(
-        decision
+        decision,
+        has_order_context,
+    )
+
+    answer = compose_customer_answer(
+        decision,
+        route,
     )
 
     return AgentResponse(
         route=route,
-        answer=decision.answer,
+        answer=answer,
     )

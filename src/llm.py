@@ -8,50 +8,53 @@ MODEL_NAME = "qwen3.5:4b"
 
 
 class AgentDecision(BaseModel):
-    """
-    Semantic decision made by the LLM before the final route
-    is normalized by the application.
-    """
-
     requires_policy: bool = Field(
         description=(
-            "True when company policy information is required "
-            "to answer the shopper correctly."
+            "True only when company policy is materially required "
+            "to answer the shopper."
         )
     )
 
     requires_order: bool = Field(
         description=(
-            "True when customer-specific or order-specific facts "
-            "are required to answer correctly."
+            "True only when authorized customer/order facts are "
+            "materially required."
         )
     )
 
     requires_human: bool = Field(
         description=(
-            "True when an applicable policy reserves the requested "
-            "determination, action, filing, review, or resolution "
-            "for a human agent."
+            "True when an applicable policy requires human handling."
         )
     )
 
     applicable_policy_sources: list[str] = Field(
         default_factory=list,
-        description="Policy source filenames that materially apply.",
+        description=(
+            "Policy filenames that materially apply to the request."
+        ),
+    )
+
+    customer_visible_policy_rules: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every material policy rule needed to answer the shopper. "
+            "Include only rules that may safely be disclosed."
+        ),
     )
 
     human_requirement: str | None = Field(
         default=None,
         description=(
-            "Short explanation of why human handling is required, "
-            "or null when it is not required."
+            "Why a human is required, or null when human handling "
+            "is not required."
         ),
     )
 
-    answer: str = Field(
+    answer_summary: str = Field(
         description=(
-            "Concise customer-facing answer grounded only "
-            "in the supplied evidence."
+            "Direct customer-facing answer to the shopper's request, "
+            "grounded only in the supplied evidence."
         )
     )
 
@@ -71,12 +74,6 @@ def generate_decision(
     system_prompt: str,
     user_prompt: str,
 ) -> AgentDecision:
-    """
-    Ask the local LLM to make the semantic support decision.
-
-    The application later converts the model's evidence requirements
-    into one of the four contract routes.
-    """
 
     response = chat(
         model=MODEL_NAME,

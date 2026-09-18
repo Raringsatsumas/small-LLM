@@ -40,6 +40,10 @@ def test_retrieval():
         "How long does a refund take?"
     )
 
+    show_results(
+    "Bloom & Vine never shipped my order. What are my options?"
+)
+
 
 if __name__ == "__main__":
     test_retrieval()
